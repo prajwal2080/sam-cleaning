@@ -602,7 +602,7 @@ export default function SamCleaningClient() {
     }
 
     // Flatpickr + ICAL might load after this effect.
-    // We try now, and also retry once on window "load".
+    // We try now, and also retry for a short time in case the scripts load late.
     let busyPicker: FlatpickrInstance | null = null;
     let timePicker: FlatpickrInstance | null = null;
 
@@ -613,11 +613,17 @@ export default function SamCleaningClient() {
 
     tryInitPickers();
 
-    const onWindowLoad = () => {
+    let initAttempts = 0;
+    const initTimer = window.setInterval(() => {
+      initAttempts += 1;
       tryInitPickers();
-    };
-    window.addEventListener("load", onWindowLoad);
-    cleanupFns.push(() => window.removeEventListener("load", onWindowLoad));
+
+      const allReady = Boolean(busyPicker) && Boolean(timePicker);
+      if (allReady || initAttempts >= 50) {
+        window.clearInterval(initTimer);
+      }
+    }, 200);
+    cleanupFns.push(() => window.clearInterval(initTimer));
 
     const unbindForm = wireEstimateFormSubmit();
     cleanupFns.push(unbindForm);
