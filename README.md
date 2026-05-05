@@ -2,6 +2,18 @@ This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-
 
 ## Getting Started
 
+## Bookings (MongoDB)
+
+This project includes a simple bookings backend at `GET/POST /api/bookings`.
+
+- Copy `.env.example` to `.env`
+- Fill in:
+	- `MONGODB_URI`
+	- `MONGODB_DB`
+
+If your server logs show `querySrv ECONNREFUSED` when using `mongodb+srv://...`,
+switch to the "Standard URI" (non-SRV) in `.env.example`.
+
 First, run the development server:
 
 ```bash
