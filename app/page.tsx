@@ -438,7 +438,6 @@ export default function Home() {
                       placeholder="dd/mm/yy"
                       aria-label="Service date"
                       autoComplete="off"
-                      data-ics-url="https://calendar.google.com/calendar/ical/ef33cd75da97d7be2c22fe2f7d389cf158c9ad94436a6fc4a4ed59a375ff8a1e%40group.calendar.google.com/public/basic.ics"
                     />
                     <i className="fa-regular fa-calendar"></i>
                   </label>

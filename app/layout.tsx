@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import Script from "next/script";
+import SonnerToaster from "./SonnerToaster";
 import "./globals.css";
 import "./sam-cleaning.css";
 
@@ -36,12 +37,9 @@ export default function RootLayout({
       </head>
       <body>
         {children}
+        <SonnerToaster />
         <Script
           src="https://cdn.jsdelivr.net/npm/flatpickr"
-          strategy="afterInteractive"
-        />
-        <Script
-          src="https://cdn.jsdelivr.net/npm/ical.js@1.5.0/build/ical.min.js"
           strategy="afterInteractive"
         />
       </body>

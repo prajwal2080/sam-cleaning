@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
+import { toast } from "sonner";
 
 type FlatpickrInstance = {
   set: (key: string, value: unknown) => void;
@@ -11,7 +12,6 @@ type FlatpickrInstance = {
 declare global {
   interface Window {
     flatpickr?: (el: Element, opts: Record<string, unknown>) => FlatpickrInstance;
-    ICAL?: any;
   }
 }
 
@@ -182,8 +182,101 @@ export default function SamCleaningClient() {
       }
     }
 
-    // --- Public Google Calendar (ICS) -> disable busy dates in Flatpickr ---
-    let busyDatesSet: Set<string> | null = null;
+    // --- Disable busy dates in Flatpickr based on DB bookings ---
+    type BusyRange = { startMin: number; endMin: number };
+
+    const WORK_START_MIN = 8 * 60;
+    const WORK_END_MIN = 20 * 60;
+    const SERVICE_DURATION_MIN = 120;
+
+    const busyRangesByDate = new Map<string, BusyRange[]>();
+    let selectedServiceDateYmd: string | null = null;
+
+    function hhmmToMinutes(value: string) {
+      if (!/^\d{2}:\d{2}$/.test(value)) return null;
+      const [hhRaw, mmRaw] = value.split(":");
+      const hh = Number.parseInt(hhRaw, 10);
+      const mm = Number.parseInt(mmRaw, 10);
+      if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+      if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+      return hh * 60 + mm;
+    }
+
+
+    function clampRange(range: BusyRange) {
+      const startMin = Math.max(0, Math.min(24 * 60, range.startMin));
+      const endMin = Math.max(0, Math.min(24 * 60, range.endMin));
+      if (endMin <= startMin) return null;
+      return { startMin, endMin };
+    }
+
+    function addBusyRangeForDate(ymd: string, range: BusyRange) {
+      const normalized = clampRange(range);
+      if (!normalized) return;
+      const list = busyRangesByDate.get(ymd) ?? [];
+      list.push(normalized);
+      busyRangesByDate.set(ymd, list);
+    }
+
+    function mergedRangesForDate(ymd: string) {
+      const ranges = (busyRangesByDate.get(ymd) ?? [])
+        .map(clampRange)
+        .filter((r): r is BusyRange => Boolean(r))
+        .sort((a, b) => a.startMin - b.startMin || a.endMin - b.endMin);
+
+      const merged: BusyRange[] = [];
+      for (const r of ranges) {
+        const last = merged[merged.length - 1];
+        if (!last || r.startMin > last.endMin) {
+          merged.push({ ...r });
+        } else {
+          last.endMin = Math.max(last.endMin, r.endMin);
+        }
+      }
+      return merged;
+    }
+
+    function hasAvailabilityForDate(ymd: string) {
+      const merged = mergedRangesForDate(ymd);
+      let cursor = WORK_START_MIN;
+
+      for (const r of merged) {
+        const start = Math.max(r.startMin, WORK_START_MIN);
+        const end = Math.min(r.endMin, WORK_END_MIN);
+        if (end <= WORK_START_MIN || start >= WORK_END_MIN) {
+          continue;
+        }
+
+        if (start - cursor >= SERVICE_DURATION_MIN) {
+          return true;
+        }
+
+        cursor = Math.max(cursor, end);
+        if (cursor >= WORK_END_MIN) {
+          return false;
+        }
+      }
+
+      return WORK_END_MIN - cursor >= SERVICE_DURATION_MIN;
+    }
+
+    function isSlotAvailable(ymd: string, startMin: number) {
+      const endMin = startMin + SERVICE_DURATION_MIN;
+
+      if (startMin < WORK_START_MIN || endMin > WORK_END_MIN) {
+        return { ok: false, reason: "Outside working hours." } as const;
+      }
+
+      const ranges = mergedRangesForDate(ymd);
+      for (const r of ranges) {
+        if (startMin < r.endMin && endMin > r.startMin) {
+          return { ok: false, reason: "This time is already booked." } as const;
+        }
+      }
+
+      return { ok: true, reason: "Available" } as const;
+    }
+
 
     function initBusyDatePicker(): FlatpickrInstance | null {
       const dateInput =
@@ -194,9 +287,6 @@ export default function SamCleaningClient() {
         return null;
       }
 
-      const GOOGLE_ICS_URL =
-        dateInput.dataset.icsUrl ||
-        "https://calendar.google.com/calendar/ical/ef33cd75da97d7be2c22fe2f7d389cf158c9ad94436a6fc4a4ed59a375ff8a1e%40group.calendar.google.com/public/basic.ics";
       const TIME_ZONE = "Asia/Kathmandu";
 
       const ymdFormatter = new Intl.DateTimeFormat("en-CA", {
@@ -210,115 +300,40 @@ export default function SamCleaningClient() {
         return ymdFormatter.format(date);
       }
 
-      const busyDates = new Set<string>();
-      busyDatesSet = busyDates;
-
-      function addBusyRange(
-        busySet: Set<string>,
-        startDate: Date | undefined,
-        endDateExclusive: Date | undefined
-      ) {
-        if (!(startDate instanceof Date) || Number.isNaN(startDate.getTime())) {
-          return;
-        }
-
-        if (
-          !(endDateExclusive instanceof Date) ||
-          Number.isNaN(endDateExclusive.getTime()) ||
-          endDateExclusive <= startDate
-        ) {
-          busySet.add(ymdInTimeZone(startDate));
-          return;
-        }
-
-        const endInclusive = new Date(endDateExclusive.getTime() - 1);
-        let cursor = new Date(startDate.getTime());
-
-        while (cursor <= endInclusive) {
-          busySet.add(ymdInTimeZone(cursor));
-          cursor = new Date(cursor.getTime() + 24 * 60 * 60 * 1000);
-        }
-      }
-
-      async function fetchIcsText(url: string) {
-        const proxies: Array<null | ((u: string) => string)> = [
-          null,
-          (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-        ];
-
-        let lastError: unknown;
-        for (const proxy of proxies) {
-          const targetUrl = proxy ? proxy(url) : url;
-          try {
-            const res = await fetch(targetUrl, {
-              method: "GET",
-              cache: "no-store",
-            });
-            if (!res.ok) {
-              throw new Error(`HTTP ${res.status}`);
-            }
-            return await res.text();
-          } catch (err) {
-            lastError = err;
-          }
-        }
-
-        throw lastError || new Error("Failed to fetch ICS");
-      }
-
-      function extractBusyDatesFromIcs(icsText: string, { rangeDays = 730 } = {}) {
-        if (!window.ICAL) {
-          throw new Error("ICAL is not available (ical.js failed to load)");
-        }
-
-        const busyDates = new Set<string>();
-        const jcalData = window.ICAL.parse(icsText);
-        const vcalendar = new window.ICAL.Component(jcalData);
-        const vevents = vcalendar.getAllSubcomponents("vevent");
-
-        const rangeEndJs = new Date(Date.now() + rangeDays * 24 * 60 * 60 * 1000);
-
-        for (const vevent of vevents) {
-          const event = new window.ICAL.Event(vevent);
-
-          if (event.isRecurring()) {
-            const rangeStart = window.ICAL.Time.fromJSDate(new Date(), true);
-            const iterator = event.iterator(rangeStart);
-
-            while (true) {
-              const next = iterator.next();
-              if (!next) {
-                break;
-              }
-
-              const startJs = next.toJSDate();
-              if (startJs > rangeEndJs) {
-                break;
-              }
-
-              const details = event.getOccurrenceDetails(next);
-              const occStart = details.startDate?.toJSDate?.() || startJs;
-              const occEnd =
-                details.endDate?.toJSDate?.() || new Date(occStart.getTime());
-              addBusyRange(busyDates, occStart, occEnd);
-            }
-          } else {
-            const startJs = event.startDate?.toJSDate?.();
-            const endJs = event.endDate?.toJSDate?.();
-            addBusyRange(busyDates, startJs, endJs);
-          }
-        }
-
-        return busyDates;
-      }
-
       const picker = window.flatpickr(dateInput, {
         dateFormat: "d/m/Y",
         disableMobile: true,
-      });
+        disable: [
+          (date: Date) => {
+            const ymd = ymdInTimeZone(date);
+            return !hasAvailabilityForDate(ymd);
+          },
+        ],
+        onDayCreate: (_dObj: unknown, _dStr: string, _fp: unknown, dayElem: HTMLElement) => {
+          const dateObj = (dayElem as any)?.dateObj as Date | undefined;
+          if (!(dateObj instanceof Date) || Number.isNaN(dateObj.getTime())) {
+            return;
+          }
 
-      // Set disable function once; it will reflect updates as busyDates changes.
-      picker.set("disable", [(date: Date) => busyDates.has(ymdInTimeZone(date))]);
+          const ymd = ymdInTimeZone(dateObj);
+          const merged = mergedRangesForDate(ymd);
+
+          if (!hasAvailabilityForDate(ymd)) {
+            dayElem.classList.add("is-busy-day");
+            dayElem.setAttribute("aria-label", `${ymd} (Fully booked)`);
+            dayElem.setAttribute("title", "Fully booked");
+          } else if (merged.length > 0) {
+            dayElem.classList.add("is-partial-busy-day");
+            dayElem.setAttribute("aria-label", `${ymd} (Some slots booked)`);
+            dayElem.setAttribute("title", "Some slots booked");
+          }
+        },
+        onChange: (selectedDates: Date[]) => {
+          const d = selectedDates?.[0];
+          selectedServiceDateYmd = d ? ymdInTimeZone(d) : null;
+          timePicker?.redraw();
+        },
+      });
 
       async function fetchBookedDatesFromDb() {
         try {
@@ -331,20 +346,30 @@ export default function SamCleaningClient() {
             throw new Error(`HTTP ${res.status}`);
           }
 
-          const data = (await res.json()) as unknown;
-          const dates =
-            data && typeof data === "object" && Array.isArray((data as any).dates)
-              ? ((data as any).dates as unknown[])
+          const data = (await res.json()) as any;
+          const bookings =
+            data && typeof data === "object" && Array.isArray(data.bookings)
+              ? (data.bookings as unknown[])
               : [];
 
-          for (const d of dates) {
-            if (typeof d === "string" && /^\d{4}-\d{2}-\d{2}$/.test(d)) {
-              busyDates.add(d);
+          let count = 0;
+          for (const b of bookings) {
+            const ymd = (b as any)?.serviceDateYmd;
+            const startMin = (b as any)?.startMin;
+            const endMin = (b as any)?.endMin;
+            if (
+              typeof ymd === "string" &&
+              /^\d{4}-\d{2}-\d{2}$/.test(ymd) &&
+              typeof startMin === "number" &&
+              typeof endMin === "number"
+            ) {
+              addBusyRangeForDate(ymd, { startMin, endMin });
+              count += 1;
             }
           }
 
           // eslint-disable-next-line no-console
-          console.info(`DB bookings loaded: ${dates.length}`);
+          console.info(`DB bookings loaded: ${count}`);
         } catch (err) {
           // eslint-disable-next-line no-console
           console.warn("Could not load busy dates from DB:", err);
@@ -352,30 +377,7 @@ export default function SamCleaningClient() {
       }
 
       (async () => {
-        await Promise.allSettled([
-          (async () => {
-            try {
-              const icsText = await fetchIcsText(GOOGLE_ICS_URL);
-              const calendarBusy = extractBusyDatesFromIcs(icsText);
-              calendarBusy.forEach((d) => busyDates.add(d));
-
-              // eslint-disable-next-line no-console
-              console.info(`Calendar busy dates loaded: ${calendarBusy.size}`);
-              if (calendarBusy.size === 0) {
-                // eslint-disable-next-line no-console
-                console.warn(
-                  "Calendar loaded but no busy dates were found. Check the calendar feed and event visibility."
-                );
-              }
-            } catch (err) {
-              // If calendar fetch/parse fails, keep the picker usable.
-              // eslint-disable-next-line no-console
-              console.warn("Could not load busy dates from calendar:", err);
-            }
-          })(),
-          fetchBookedDatesFromDb(),
-        ]);
-
+        await fetchBookedDatesFromDb();
         picker.redraw();
       })();
 
@@ -392,13 +394,56 @@ export default function SamCleaningClient() {
         return null;
       }
 
-      return window.flatpickr(timeInput, {
+      const lastStartMin = WORK_END_MIN - SERVICE_DURATION_MIN;
+      const maxStartHh = Math.floor(lastStartMin / 60);
+      const maxStartMm = lastStartMin % 60;
+      const maxTime = `${String(maxStartHh).padStart(2, "0")}:${String(maxStartMm).padStart(2, "0")}`;
+
+      const picker = window.flatpickr(timeInput, {
         enableTime: true,
         noCalendar: true,
         time_24hr: true,
         dateFormat: "H:i",
+        minuteIncrement: 30,
+        minTime: "08:00",
+        maxTime,
         disableMobile: true,
+        disable: [
+          (date: Date) => {
+            if (!selectedServiceDateYmd) {
+              return false;
+            }
+
+            // flatpickr time-only uses a Date; interpret its local HH:mm.
+            const timeMin = date.getHours() * 60 + date.getMinutes();
+            const timeEndMin = timeMin + SERVICE_DURATION_MIN;
+
+            if (timeMin < WORK_START_MIN || timeEndMin > WORK_END_MIN) {
+              return true;
+            }
+
+            const ranges = mergedRangesForDate(selectedServiceDateYmd);
+            for (const r of ranges) {
+              // Overlap check: [timeMin, timeEndMin) intersects [r.startMin, r.endMin)
+              if (timeMin < r.endMin && timeEndMin > r.startMin) {
+                return true;
+              }
+            }
+            return false;
+          },
+        ],
+        onChange: (_selectedDates: Date[], dateStr: string) => {
+          const startMin = hhmmToMinutes(dateStr.trim());
+          if (selectedServiceDateYmd && startMin !== null) {
+            const availability = isSlotAvailable(selectedServiceDateYmd, startMin);
+            if (!availability.ok) {
+              toast.error(availability.reason);
+            }
+          }
+        },
       });
+
+      return picker;
     }
 
     // --- Frontend-only form submit (no backend) ---
@@ -406,73 +451,6 @@ export default function SamCleaningClient() {
       const form = document.querySelector<HTMLFormElement>(".estimate-form");
       if (!form) {
         return () => {};
-      }
-
-      function buildGoogleCalendarTemplateUrl(formData: FormData) {
-        const serviceDate = String(formData.get("serviceDate") || "").trim();
-        // Flatpickr dateFormat is d/m/Y (e.g. 03/05/2026)
-        const parts = serviceDate.split("/").map((p) => p.trim());
-        if (parts.length !== 3) {
-          return null;
-        }
-        const [dd, mm, yyyy] = parts;
-        if (!dd || !mm || !yyyy) {
-          return null;
-        }
-
-        const yyyymmdd = `${yyyy}${mm.padStart(2, "0")}${dd.padStart(2, "0")}`;
-
-        const titleBits = [String(formData.get("serviceType") || "").trim(), "Cleaning"];
-        const fullName = String(formData.get("fullName") || "").trim();
-        if (fullName) {
-          titleBits.push("-", fullName);
-        }
-        const text = titleBits.filter(Boolean).join(" ");
-
-        const detailsLines: string[] = [];
-        const fields: Array<[string, string]> = [
-          ["Name", "fullName"],
-          ["Phone", "phone"],
-          ["Email", "email"],
-          ["Service type", "serviceType"],
-          ["Frequency", "frequency"],
-          ["Rooms", "rooms"],
-          ["Bedrooms", "bedrooms"],
-          ["Bathrooms", "bathrooms"],
-          ["Property type", "propertyType"],
-          ["Approx SF", "approxSf"],
-          ["ZIP", "zipCode"],
-          ["Time", "serviceTime"],
-          ["Address", "address"],
-        ];
-
-        for (const [label, key] of fields) {
-          const value = String(formData.get(key) || "").trim();
-          if (value) {
-            detailsLines.push(`${label}: ${value}`);
-          }
-        }
-
-        const url = new URL("https://calendar.google.com/calendar/render");
-        url.searchParams.set("action", "TEMPLATE");
-        url.searchParams.set("text", text || "Cleaning booking");
-        // All-day event on the selected date.
-        // Google expects end date to be exclusive, so use +1 day.
-        const endDate = new Date(Number(yyyy), Number(mm) - 1, Number(dd));
-        if (!Number.isNaN(endDate.getTime())) {
-          endDate.setDate(endDate.getDate() + 1);
-          const endY = String(endDate.getFullYear());
-          const endM = String(endDate.getMonth() + 1).padStart(2, "0");
-          const endD = String(endDate.getDate()).padStart(2, "0");
-          url.searchParams.set("dates", `${yyyymmdd}/${endY}${endM}${endD}`);
-        } else {
-          url.searchParams.set("dates", `${yyyymmdd}/${yyyymmdd}`);
-        }
-        url.searchParams.set("ctz", "Asia/Kathmandu");
-        if (detailsLines.length) {
-          url.searchParams.set("details", detailsLines.join("\n"));
-        }
-        return url.toString();
       }
 
       const onSubmit = (event: Event) => {
@@ -492,30 +470,46 @@ export default function SamCleaningClient() {
         const originalBtnHtml = submitBtn ? submitBtn.innerHTML : "";
 
         const outgoingData = new FormData(form);
-        const calendarUrl = buildGoogleCalendarTemplateUrl(outgoingData);
-        // Open a blank window immediately (user gesture) to avoid popup blockers.
-        // We’ll navigate it after the async submit succeeds.
-        const calendarWindow = calendarUrl ? window.open("", "_blank") : null;
-        if (calendarWindow && calendarWindow.document) {
-          calendarWindow.document.title = "Creating calendar event…";
-          calendarWindow.document.body.innerText = "Preparing calendar event…";
-        }
 
         const ensureStatusEl = () => {
           let el = form.querySelector<HTMLParagraphElement>(".js-form-status");
           if (!el) {
             el = document.createElement("p");
             el.className = "js-form-status";
-            el.setAttribute("aria-live", "polite");
-            el.style.margin = "0.85rem 0 0";
-            el.style.fontSize = "0.95rem";
             form.appendChild(el);
           }
+
+          el.setAttribute("aria-live", "polite");
+          // Keep it accessible but never visible (prevents layout shifts).
+          el.style.position = "absolute";
+          el.style.width = "1px";
+          el.style.height = "1px";
+          el.style.padding = "0";
+          el.style.margin = "-1px";
+          el.style.overflow = "hidden";
+          el.style.clip = "rect(0, 0, 0, 0)";
+          el.style.whiteSpace = "nowrap";
+          el.style.border = "0";
+
           return el;
         };
 
         const statusEl = ensureStatusEl();
-        statusEl.textContent = "Sending...";
+        statusEl.textContent = "";
+
+        // Client-side availability guard (server also enforces this).
+        const dateInput = form.querySelector<HTMLInputElement>(".js-service-date");
+        const timeInput = form.querySelector<HTMLInputElement>(".js-service-time");
+        const hasDate = Boolean(String(dateInput?.value || "").trim());
+        const timeValue = String(timeInput?.value || "").trim();
+        const startMin = hhmmToMinutes(timeValue);
+        if (hasDate && selectedServiceDateYmd && startMin !== null) {
+          const availability = isSlotAvailable(selectedServiceDateYmd, startMin);
+          if (!availability.ok) {
+            toast.error(availability.reason);
+            return;
+          }
+        }
 
         if (submitBtn) {
           submitBtn.disabled = true;
@@ -533,40 +527,30 @@ export default function SamCleaningClient() {
             });
 
             if (res.ok) {
-              statusEl.textContent = "Thanks! Your booking was saved.";
+              statusEl.textContent = "";
+              toast.success("Booking saved.");
 
               try {
                 const data = (await res.json()) as any;
-                if (data && typeof data.serviceDateYmd === "string") {
-                  busyDatesSet?.add(data.serviceDateYmd);
+                if (
+                  data &&
+                  typeof data.serviceDateYmd === "string" &&
+                  typeof data.startMin === "number" &&
+                  typeof data.endMin === "number"
+                ) {
+                  addBusyRangeForDate(data.serviceDateYmd, {
+                    startMin: data.startMin,
+                    endMin: data.endMin,
+                  });
                   busyPicker?.redraw();
+                  timePicker?.redraw();
                 }
               } catch {
                 // ignore JSON parse errors
               }
 
-              if (calendarUrl) {
-                if (calendarWindow && !calendarWindow.closed) {
-                  calendarWindow.location.href = calendarUrl;
-                } else {
-                  // Popup blocked; provide a clickable link.
-                  statusEl.textContent = "";
-                  statusEl.append("Thanks! Your booking was saved. ");
-                  const link = document.createElement("a");
-                  link.href = calendarUrl;
-                  link.target = "_blank";
-                  link.rel = "noopener noreferrer";
-                  link.textContent = "Add to Google Calendar";
-                  statusEl.append(link);
-                  statusEl.append(".");
-                }
-              }
               form.reset();
               return;
-            }
-
-            if (calendarWindow && !calendarWindow.closed) {
-              calendarWindow.close();
             }
 
             let message = `Could not save booking (HTTP ${res.status}).`;
@@ -580,14 +564,12 @@ export default function SamCleaningClient() {
             }
 
             statusEl.textContent = message;
+            toast.error(message);
           } catch (err) {
             // eslint-disable-next-line no-console
             console.warn("Form submission failed:", err);
             statusEl.textContent = "Network error. Please try again.";
-
-            if (calendarWindow && !calendarWindow.closed) {
-              calendarWindow.close();
-            }
+            toast.error("Network error. Please try again.");
           } finally {
             if (submitBtn) {
               submitBtn.disabled = false;
@@ -601,7 +583,7 @@ export default function SamCleaningClient() {
       return () => form.removeEventListener("submit", onSubmit);
     }
 
-    // Flatpickr + ICAL might load after this effect.
+    // Flatpickr might load after this effect.
     // We try now, and also retry for a short time in case the scripts load late.
     let busyPicker: FlatpickrInstance | null = null;
     let timePicker: FlatpickrInstance | null = null;

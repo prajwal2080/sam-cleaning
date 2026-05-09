@@ -5,11 +5,17 @@ import { ensureBookingIndexes, getDb } from "../../../lib/mongodb";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+const DEFAULT_DURATION_MINUTES = 120;
+const WORK_START_MIN = 8 * 60;
+const WORK_END_MIN = 20 * 60;
+
 type BookingDoc = {
   _id?: ObjectId;
   serviceDateYmd: string; // YYYY-MM-DD
   serviceDateDisplay?: string; // original dd/mm/yyyy from flatpickr
   serviceTime?: string;
+  startMin: number; // minutes since midnight
+  endMin: number; // minutes since midnight
   serviceType?: string;
   frequency?: string;
   rooms?: string;
@@ -38,6 +44,16 @@ function ddmmyyyyToYmd(serviceDate: string) {
   return isYmd(ymd) ? ymd : null;
 }
 
+function hhmmToMinutes(value: string) {
+  if (!/^\d{2}:\d{2}$/.test(value)) return null;
+  const [hhRaw, mmRaw] = value.split(":");
+  const hh = Number.parseInt(hhRaw, 10);
+  const mm = Number.parseInt(mmRaw, 10);
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return null;
+  return hh * 60 + mm;
+}
+
 function pickString(formData: FormData, key: string) {
   const raw = formData.get(key);
   if (typeof raw !== "string") return undefined;
@@ -63,16 +79,30 @@ export async function GET(request: Request) {
     }
 
     const docs = await db
-      .collection<Pick<BookingDoc, "serviceDateYmd">>("bookings")
+      .collection<Pick<BookingDoc, "serviceDateYmd" | "startMin" | "endMin">>(
+        "bookings"
+      )
       .find(query)
-      .project({ serviceDateYmd: 1 })
+      .project({ serviceDateYmd: 1, startMin: 1, endMin: 1 })
       .toArray();
 
-    const dates = docs
-      .map((d) => d.serviceDateYmd)
-      .filter((d): d is string => typeof d === "string" && isYmd(d));
+    const bookings = docs
+      .filter(
+        (d) =>
+          typeof d.serviceDateYmd === "string" &&
+          isYmd(d.serviceDateYmd) &&
+          typeof (d as any).startMin === "number" &&
+          typeof (d as any).endMin === "number"
+      )
+      .map((d) => ({
+        serviceDateYmd: d.serviceDateYmd,
+        startMin: (d as any).startMin as number,
+        endMin: (d as any).endMin as number,
+      }));
 
-    return NextResponse.json({ dates });
+    const dates = Array.from(new Set(bookings.map((b) => b.serviceDateYmd)));
+
+    return NextResponse.json({ dates, bookings });
   } catch (err: any) {
     // eslint-disable-next-line no-console
     console.error("GET /api/bookings failed:", err);
@@ -117,10 +147,53 @@ export async function POST(request: Request) {
       );
     }
 
+    const serviceTime = pickString(formData, "serviceTime");
+    if (!serviceTime) {
+      return NextResponse.json(
+        { error: "Missing serviceTime" },
+        { status: 400 }
+      );
+    }
+
+    const startMin = hhmmToMinutes(serviceTime);
+    if (startMin === null) {
+      return NextResponse.json(
+        { error: "Invalid serviceTime format" },
+        { status: 400 }
+      );
+    }
+
+    const endMin = startMin + DEFAULT_DURATION_MINUTES;
+
+    if (startMin < WORK_START_MIN || endMin > WORK_END_MIN) {
+      return NextResponse.json(
+        { error: "Selected time is not available." },
+        { status: 400 }
+      );
+    }
+
+    const overlap = await db.collection<Pick<BookingDoc, "_id">>("bookings").findOne(
+      {
+        serviceDateYmd,
+        startMin: { $lt: endMin },
+        endMin: { $gt: startMin },
+      },
+      { projection: { _id: 1 } }
+    );
+
+    if (overlap) {
+      return NextResponse.json(
+        { error: "That time is already booked." },
+        { status: 409 }
+      );
+    }
+
     const doc: BookingDoc = {
       serviceDateYmd,
       serviceDateDisplay,
-      serviceTime: pickString(formData, "serviceTime"),
+      serviceTime,
+      startMin,
+      endMin,
       serviceType: pickString(formData, "serviceType"),
       frequency: pickString(formData, "frequency"),
       rooms: pickString(formData, "rooms"),
@@ -142,11 +215,13 @@ export async function POST(request: Request) {
       ok: true,
       bookingId: result.insertedId.toString(),
       serviceDateYmd,
+      startMin,
+      endMin,
     });
   } catch (err: any) {
     if (err && typeof err === "object" && err.code === 11000) {
       return NextResponse.json(
-        { error: "That date is already booked." },
+        { error: "That time is already booked." },
         { status: 409 }
       );
     }

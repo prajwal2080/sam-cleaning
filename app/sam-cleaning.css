@@ -3,9 +3,42 @@
   --accent-blue: #0f74ff;
   --topbar: #11267b;
   --accent-yellow: #efe61d;
+  --busy-red: #d94848;
   --text: #2f3a4a;
   --muted: #5d6879;
   --white: #ffffff;
+}
+
+/* Flatpickr: mark fully busy days in red */
+.flatpickr-day.is-busy-day {
+  background: var(--busy-red) !important;
+  border-color: transparent !important;
+  color: var(--white) !important;
+  opacity: 1 !important;
+}
+
+/* Flatpickr: mark partially booked days in yellow */
+.flatpickr-day.is-partial-busy-day {
+  background: var(--accent-yellow) !important;
+  border-color: transparent !important;
+  color: var(--text) !important;
+  opacity: 1 !important;
+}
+
+.flatpickr-day.flatpickr-disabled.is-busy-day {
+  background: var(--busy-red) !important;
+  color: var(--white) !important;
+  opacity: 1 !important;
+}
+
+.flatpickr-day.is-busy-day:hover,
+.flatpickr-day.is-busy-day:focus {
+  background: var(--busy-red) !important;
+}
+
+.flatpickr-day.is-partial-busy-day:hover,
+.flatpickr-day.is-partial-busy-day:focus {
+  background: var(--accent-yellow) !important;
 }
 
 * {

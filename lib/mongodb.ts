@@ -56,10 +56,29 @@ export async function ensureBookingIndexes() {
 
   globalForMongo.__mongoIndexesPromise = (async () => {
     const db = await getDb();
+
+    const coll = db.collection("bookings");
+    try {
+      const indexes = await coll.indexes();
+      const old = indexes.find((idx) => idx.name === "uniq_serviceDateYmd");
+      if (old) {
+        await coll.dropIndex("uniq_serviceDateYmd");
+      }
+    } catch {
+      // ignore index inspection errors
+    }
+
     await db.collection("bookings").createIndex(
-      { serviceDateYmd: 1 },
-      { unique: true, name: "uniq_serviceDateYmd" }
+      { serviceDateYmd: 1, startMin: 1 },
+      { unique: true, name: "uniq_serviceDateYmd_startMin" }
     );
+
+    await db
+      .collection("bookings")
+      .createIndex(
+        { serviceDateYmd: 1, startMin: 1, endMin: 1 },
+        { name: "idx_serviceDateYmd_startMin_endMin" }
+      );
   })();
 
   return globalForMongo.__mongoIndexesPromise;
